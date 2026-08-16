@@ -1,0 +1,505 @@
+#include "services/wifi_setup.h"
+
+#include <WiFi.h>
+#include <WiFiManager.h>
+
+#include <cstdio>
+
+#include <Preferences.h>
+#include <esp_system.h>
+#include <esp_wifi.h>
+
+#ifdef WM_MDNS
+#include <ESPmDNS.h>
+#endif
+
+#include "config.h"
+#include "hardware/power.h"
+#include "services/radar_location.h"
+#include "services/time_settings.h"
+#include "ui/radar_range.h"
+#include "ui/status_screens.h"
+
+namespace {
+
+/** Separate from planeradar prefs (rangeInit) to avoid NVS handle conflicts. */
+constexpr char kWifiPrefsNamespace[] = "wifi";
+constexpr char kPrefsForcePortalKey[] = "portal";
+
+bool s_force_config_portal = false;
+WiFiManager s_wm;
+bool s_wm_configured = false;
+bool s_has_portal_log = false;
+unsigned long s_last_portal_log_ms = 0;
+
+void ensureWifiManager();
+void startLanWebPortal();
+void stopLanWebPortal();
+bool wifiLinkUp();
+
+constexpr int kCoordParamLen = 20;
+constexpr char kCoordInputAttrs[] = " type=\"number\" step=\"0.000001\"";
+
+constexpr char kCitySelectorHtml[] = R"html(
+<label>City search</label><input class="city-search" type="search" placeholder="Type a city name">
+<label>City preset</label><select class="city-preset"><option value="">Manual coordinates</option>
+<option value="Encinitas|33.077194|-117.235417">Encinitas, United States</option>
+<option value="Amsterdam|52.367600|4.904100">Amsterdam, Netherlands</option>
+<option value="London|51.507400|-0.127800">London, United Kingdom</option>
+<option value="Paris|48.856600|2.352200">Paris, France</option>
+<option value="Berlin|52.520000|13.405000">Berlin, Germany</option>
+<option value="Madrid|40.416800|-3.703800">Madrid, Spain</option>
+<option value="Rome|41.902800|12.496400">Rome, Italy</option>
+<option value="New York|40.712800|-74.006000">New York, United States</option>
+<option value="Chicago|41.878100|-87.629800">Chicago, United States</option>
+<option value="Los Angeles|34.052200|-118.243700">Los Angeles, United States</option>
+<option value="Tokyo|35.676200|139.650300">Tokyo, Japan</option>
+<option value="Seoul|37.566500|126.978000">Seoul, South Korea</option>
+<option value="Singapore|1.352100|103.819800">Singapore</option>
+<option value="Sydney|-33.868800|151.209300">Sydney, Australia</option>
+<option value="Shanghai|31.230400|121.473700">Shanghai, China</option>
+<option value="Beijing|39.904200|116.407400">Beijing, China</option></select>
+<p>Offline presets fill latitude and longitude only. Search by city, then save; you can always enter coordinates manually below.</p>
+<script>(function(){const search=document.querySelector('.city-search');const select=document.querySelector('.city-preset');const options=Array.from(select.options);search.addEventListener('input',function(){const query=search.value.trim().toLowerCase();select.innerHTML='';options.forEach(function(option){if(!query||!option.value||option.text.toLowerCase().includes(query)){select.add(option.cloneNode(true));}});});select.addEventListener('change',function(){if(!select.value)return;const value=select.value.split('|');document.querySelector('[name=radar_lat]').value=Number(value[1]).toFixed(6);document.querySelector('[name=radar_lon]').value=Number(value[2]).toFixed(6);});})();</script>
+)html";
+
+constexpr char kTimeSettingsHintHtml[] = R"html(
+<p>Automatic timezone uses the default radar location. Enable manual timezone only when you need an override; enter a POSIX timezone such as CST-8 for China or EST5EDT,M3.2.0,M11.1.0 for US Eastern time.</p>
+<script>(function(){const manual=document.getElementById('manual_tz');const zone=document.getElementById('time_zone');function update(){zone.disabled=!manual.checked;}manual.addEventListener('change',update);update();})();</script>
+)html";
+
+WiFiManagerParameter s_param_city_selector(kCitySelectorHtml);
+
+WiFiManagerParameter s_param_lat("radar_lat", "Latitude (deg)", "0",
+                                 kCoordParamLen, kCoordInputAttrs);
+WiFiManagerParameter s_param_lon("radar_lon", "Longitude (deg)", "0",
+                                 kCoordParamLen, kCoordInputAttrs);
+
+char s_manual_timezone_attrs[32] = "type=\"checkbox\"";
+WiFiManagerParameter s_param_manual_timezone("manual_tz", "Use manual timezone", "T", 2,
+                                             s_manual_timezone_attrs, WFM_LABEL_AFTER);
+WiFiManagerParameter s_param_timezone("time_zone", "Manual POSIX timezone", "",
+                                      64, "placeholder=\"CST-8\"");
+WiFiManagerParameter s_param_time_settings_hint(kTimeSettingsHintHtml);
+char s_clock_24h_attrs[32] = "type=\"checkbox\" checked";
+WiFiManagerParameter s_param_clock_24h("clock_24h", "Use 24-hour time", "T", 2,
+                                       s_clock_24h_attrs, WFM_LABEL_AFTER);
+
+char s_miles_checkbox_attrs[32] = "type=\"checkbox\"";
+WiFiManagerParameter s_param_miles("use_miles", "Display distances in miles", "T", 2,
+                                   s_miles_checkbox_attrs, WFM_LABEL_AFTER);
+
+char s_runways_checkbox_attrs[32] = "type=\"checkbox\"";
+WiFiManagerParameter s_param_runways("show_runways", "Show airport runways", "T", 2,
+                                     s_runways_checkbox_attrs, WFM_LABEL_AFTER);
+
+char s_sweep_checkbox_attrs[32] = "type=\"checkbox\" checked";
+WiFiManagerParameter s_param_sweep("show_sweep", "Show radar sweep", "T", 2,
+                                   s_sweep_checkbox_attrs, WFM_LABEL_AFTER);
+
+void refreshPortalParamDefaults() {
+  char lat_buf[kCoordParamLen + 1];
+  char lon_buf[kCoordParamLen + 1];
+  snprintf(lat_buf, sizeof(lat_buf), "%.6f", services::location::lat());
+  snprintf(lon_buf, sizeof(lon_buf), "%.6f", services::location::lon());
+  s_param_lat.setValue(lat_buf, kCoordParamLen);
+  s_param_lon.setValue(lon_buf, kCoordParamLen);
+  snprintf(s_manual_timezone_attrs, sizeof(s_manual_timezone_attrs),
+           "type=\"checkbox\"%s",
+           services::time_settings::usesManualTimeZone() ? " checked" : "");
+  s_param_manual_timezone.setValue("T", 2);
+  s_param_timezone.setValue(services::time_settings::usesManualTimeZone()
+                                ? services::time_settings::timeZone()
+                                : "",
+                            64);
+  snprintf(s_clock_24h_attrs, sizeof(s_clock_24h_attrs), "type=\"checkbox\"%s",
+           services::time_settings::uses24HourClock() ? " checked" : "");
+  s_param_clock_24h.setValue("T", 2);
+  snprintf(s_miles_checkbox_attrs, sizeof(s_miles_checkbox_attrs), "type=\"checkbox\"%s",
+           ui::radar::useMiles() ? " checked" : "");
+  s_param_miles.setValue("T", 2);
+  snprintf(s_runways_checkbox_attrs, sizeof(s_runways_checkbox_attrs),
+           "type=\"checkbox\"%s", ui::radar::showRunways() ? " checked" : "");
+  s_param_runways.setValue("T", 2);
+  snprintf(s_sweep_checkbox_attrs, sizeof(s_sweep_checkbox_attrs),
+           "type=\"checkbox\"%s", ui::radar::showSweep() ? " checked" : "");
+  s_param_sweep.setValue("T", 2);
+}
+
+void onPortalParamsSaved() {
+  if (!services::location::saveFromStrings(s_param_lat.getValue(),
+                                           s_param_lon.getValue())) {
+    Serial.println("Invalid lat/lon in portal — keeping previous location");
+  }
+  services::time_settings::saveFromPortal(s_param_manual_timezone.getValue(),
+                                          s_param_timezone.getValue(),
+                                          s_param_clock_24h.getValue());
+  ui::radar::saveMilesFromPortal(s_param_miles.getValue());
+  ui::radar::saveRunwaysFromPortal(s_param_runways.getValue());
+  ui::radar::saveSweepFromPortal(s_param_sweep.getValue());
+  refreshPortalParamDefaults();
+}
+
+void attachPortalParams(WiFiManager &wm) {
+  refreshPortalParamDefaults();
+  wm.addParameter(&s_param_city_selector);
+  wm.addParameter(&s_param_lat);
+  wm.addParameter(&s_param_lon);
+  wm.addParameter(&s_param_manual_timezone);
+  wm.addParameter(&s_param_timezone);
+  wm.addParameter(&s_param_time_settings_hint);
+  wm.addParameter(&s_param_clock_24h);
+  wm.addParameter(&s_param_miles);
+  wm.addParameter(&s_param_runways);
+  wm.addParameter(&s_param_sweep);
+  wm.setSaveParamsCallback(onPortalParamsSaved);
+}
+
+void logPortalLifecycle(const char *event) {
+  constexpr unsigned long kPortalLogMinIntervalMs = 1000UL;
+  const unsigned long now_ms = millis();
+  if (s_has_portal_log && now_ms - s_last_portal_log_ms < kPortalLogMinIntervalMs) {
+    return;
+  }
+  s_has_portal_log = true;
+  s_last_portal_log_ms = now_ms;
+  Serial.printf("Portal: %s\n", event);
+}
+
+void markForceConfigPortal() {
+  s_force_config_portal = true;
+  Preferences prefs;
+  if (!prefs.begin(kWifiPrefsNamespace, false)) {
+    return;
+  }
+  prefs.putBool(kPrefsForcePortalKey, true);
+  prefs.end();
+}
+
+bool consumeForceConfigPortal() {
+  if (s_force_config_portal) {
+    s_force_config_portal = false;
+    Preferences prefs;
+    if (prefs.begin(kWifiPrefsNamespace, false)) {
+      prefs.remove(kPrefsForcePortalKey);
+      prefs.end();
+    }
+    return true;
+  }
+
+  Preferences prefs;
+  if (!prefs.begin(kWifiPrefsNamespace, true)) {
+    return false;
+  }
+  const bool pending = prefs.getBool(kPrefsForcePortalKey, false);
+  prefs.end();
+  if (!pending) {
+    return false;
+  }
+
+  if (prefs.begin(kWifiPrefsNamespace, false)) {
+    prefs.remove(kPrefsForcePortalKey);
+    prefs.end();
+  }
+  return true;
+}
+
+bool storedWifiCredentials() {
+  wifi_mode_t mode = WIFI_MODE_NULL;
+  if (esp_wifi_get_mode(&mode) != ESP_OK || mode == WIFI_MODE_NULL) {
+    WiFi.mode(WIFI_STA);
+    delay(50);
+  }
+
+  wifi_config_t conf = {};
+  if (esp_wifi_get_config(WIFI_IF_STA, &conf) != ESP_OK) {
+    return false;
+  }
+  return conf.sta.ssid[0] != '\0';
+}
+
+void eraseWifiCredentials() {
+  stopLanWebPortal();
+  WiFi.setAutoReconnect(false);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+
+  ensureWifiManager();
+  WiFi.persistent(true);
+  s_wm.resetSettings();
+  s_wm.erase();
+  WiFi.disconnect(true, true);
+  WiFi.persistent(false);
+
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+}
+
+void resetWifiCredentials() {
+  markForceConfigPortal();
+  eraseWifiCredentials();
+  services::location::clear();
+  ui::radar::unitsReset();
+  Serial.println("WiFi credentials, location, and units cleared");
+}
+
+void onConfigPortalApStarted(WiFiManager *) {
+  logPortalLifecycle("setup AP started");
+  statusScreenPortal();
+#ifdef WM_MDNS
+  if (MDNS.begin(config::kPortalHostname)) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.printf("Setup portal: http://%s.local (or http://%s)\n",
+                  config::kPortalHostname, config::kPortalIp);
+  } else {
+    Serial.printf("Setup portal: http://%s (mDNS unavailable)\n", config::kPortalIp);
+  }
+#else
+  Serial.printf("Setup portal: http://%s\n", config::kPortalIp);
+#endif
+}
+
+bool wifiLinkUp() {
+  return WiFi.status() == WL_CONNECTED &&
+         WiFi.localIP() != IPAddress(0, 0, 0, 0);
+}
+
+void ensureWifiManager() {
+  if (s_wm_configured) {
+    return;
+  }
+  s_wm.setConfigPortalTimeout(config::kWifiPortalTimeoutSec);
+  s_wm.setAPStaticIPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
+                           IPAddress(255, 255, 255, 0));
+  s_wm.setHostname(config::kPortalHostname);
+  s_wm.setAPCallback(onConfigPortalApStarted);
+  attachPortalParams(s_wm);
+  s_wm_configured = true;
+}
+
+void startLanWebPortal() {
+  if (!wifiLinkUp() || s_wm.getWebPortalActive() ||
+      s_wm.getConfigPortalActive()) {
+    return;
+  }
+  refreshPortalParamDefaults();
+  WiFi.mode(WIFI_STA);
+  s_wm.setConfigPortalBlocking(false);
+#ifdef WM_MDNS
+  MDNS.end();
+  if (MDNS.begin(config::kPortalHostname)) {
+    MDNS.addService("http", "tcp", 80);
+  }
+#endif
+  s_wm.startWebPortal();
+  logPortalLifecycle("LAN portal started");
+  Serial.printf("LAN config: http://%s.local or http://%s\n",
+                config::kPortalHostname, WiFi.localIP().toString().c_str());
+}
+
+void stopLanWebPortal() {
+  if (!s_wm.getWebPortalActive()) {
+    return;
+  }
+  logPortalLifecycle("LAN portal stopped");
+  s_wm.stopWebPortal();
+#ifdef WM_MDNS
+  MDNS.end();
+#endif
+}
+
+void prepareSta() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(WIFI_PS_NONE);
+  WiFi.setAutoReconnect(true);
+}
+
+void startStaConnect(const String &ssid, const String &pass) {
+  prepareSta();
+  if (ssid.length() > 0) {
+    WiFi.begin(ssid.c_str(), pass.c_str());
+  } else {
+    WiFi.begin();
+  }
+}
+
+bool waitForLinkWithUi(unsigned long attempt_ms) {
+  const unsigned long deadline = millis() + attempt_ms;
+  while (millis() < deadline) {
+    if (wifiLinkUp()) {
+      return true;
+    }
+    powerPoll();
+    statusScreenConnectingTick();
+    delay(config::kWifiConnectingFrameMs);
+  }
+  return wifiLinkUp();
+}
+
+bool tryConnectWithUi(const String &ssid, const String &pass, bool show_ui) {
+  if (wifiLinkUp()) {
+    return true;
+  }
+
+  const char *ui_ssid = ssid.length() > 0 ? ssid.c_str() : "network";
+  if (show_ui) {
+    statusScreenConnectingBegin(ui_ssid);
+  }
+
+  for (uint8_t attempt = 1; attempt <= config::kWifiConnectAttempts; ++attempt) {
+    if (attempt > 1) {
+      Serial.printf("WiFi connect retry %u/%u\n", attempt,
+                    config::kWifiConnectAttempts);
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      delay(400);
+    }
+
+    startStaConnect(ssid, pass);
+
+    if (waitForLinkWithUi(config::kWifiConnectAttemptMs)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool connectSavedNetwork(bool show_ui) {
+  if (!storedWifiCredentials()) {
+    return false;
+  }
+
+  ensureWifiManager();
+  const String ssid = s_wm.getWiFiSSID();
+  if (ssid.length() == 0) {
+    return false;
+  }
+  const String pass = s_wm.getWiFiPass();
+  return tryConnectWithUi(ssid, pass, show_ui);
+}
+
+bool openConfigPortal() {
+  stopLanWebPortal();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(50);
+  statusScreenPortal();
+  powerPauseIdleTimeout(true);
+  refreshPortalParamDefaults();
+  s_wm.setConfigPortalBlocking(false);
+  s_wm.startConfigPortal(config::kPortalApName);
+  logPortalLifecycle("setup portal requested");
+  while (s_wm.getConfigPortalActive()) {
+    powerPoll();
+    if (s_wm.process()) {
+      powerPauseIdleTimeout(false);
+      return true;
+    }
+    delay(10);
+  }
+  powerPauseIdleTimeout(false);
+  logPortalLifecycle("setup portal stopped");
+  return wifiLinkUp();
+}
+
+}  // namespace
+
+bool wifiShowsSetupScreenOnBoot() {
+  if (s_force_config_portal) {
+    return true;
+  }
+  Preferences prefs;
+  if (!prefs.begin(kWifiPrefsNamespace, true)) {
+    return false;
+  }
+  const bool pending = prefs.getBool(kPrefsForcePortalKey, false);
+  prefs.end();
+  return pending;
+}
+
+bool wifiReconnect() {
+  Serial.println("WiFi reconnecting...");
+  return connectSavedNetwork(true);
+}
+
+void wifiResetCredentialsAndReboot() {
+  resetWifiCredentials();
+  statusScreenWifiReset();
+  delay(800);
+  esp_restart();
+}
+
+void wifiLoop() {
+  ensureWifiManager();
+  if (wifiLinkUp()) {
+    if (!s_wm.getWebPortalActive() && !s_wm.getConfigPortalActive()) {
+      startLanWebPortal();
+    }
+    if (s_wm.getWebPortalActive() || s_wm.getConfigPortalActive()) {
+      powerPoll();
+      s_wm.process();
+    }
+  } else {
+    stopLanWebPortal();
+  }
+}
+
+bool wifiSetupConnect() {
+  ensureWifiManager();
+
+  const bool force_portal = consumeForceConfigPortal();
+  WiFi.setAutoReconnect(false);
+
+  if (force_portal) {
+    eraseWifiCredentials();
+    WiFi.mode(WIFI_OFF);
+    delay(100);
+  }
+
+  if (force_portal) {
+    Serial.println("Opening WiFi setup portal (after reset)");
+    if (openConfigPortal() && wifiLinkUp()) {
+      WiFi.setAutoReconnect(true);
+      Serial.printf("Connected: %s  IP %s\n", WiFi.SSID().c_str(),
+                    WiFi.localIP().toString().c_str());
+      return true;
+    }
+    Serial.println("WiFi connection failed");
+    statusScreenConnectFailed();
+    return false;
+  }
+
+  Serial.println("Connecting to WiFi (portal opens if needed)...");
+
+  if (wifiLinkUp()) {
+    WiFi.setAutoReconnect(true);
+    Serial.printf("Connected: %s  IP %s\n", WiFi.SSID().c_str(),
+                  WiFi.localIP().toString().c_str());
+    return true;
+  }
+
+  if (storedWifiCredentials() && connectSavedNetwork(true)) {
+    WiFi.setAutoReconnect(true);
+    Serial.printf("Connected: %s  IP %s\n", WiFi.SSID().c_str(),
+                  WiFi.localIP().toString().c_str());
+    return true;
+  }
+
+  if (storedWifiCredentials()) {
+    Serial.println("Saved WiFi could not connect — opening setup portal");
+  } else {
+    Serial.println("No saved WiFi — opening setup portal");
+  }
+
+  if (openConfigPortal() && wifiLinkUp()) {
+    WiFi.setAutoReconnect(true);
+    Serial.printf("Connected: %s  IP %s\n", WiFi.SSID().c_str(),
+                  WiFi.localIP().toString().c_str());
+    return true;
+  }
+
+  Serial.println("WiFi connection failed");
+  statusScreenConnectFailed();
+  return false;
+}
