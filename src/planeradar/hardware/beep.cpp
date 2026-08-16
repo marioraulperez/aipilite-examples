@@ -83,7 +83,6 @@ void beepInit() {
   cfg.copyFrom(s_info);
   cfg.output_device = DAC_OUTPUT_ALL;
   cfg.is_master = true;
-  cfg.fixed_mclk = kSampleRate * 256;
   if (!s_i2s.begin(cfg)) {
     Serial.println("beep: ES8311 init failed");
     return;

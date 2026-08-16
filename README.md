@@ -48,3 +48,31 @@ pip install platformio
 # compile & upload basic demo
 pip run -t upload -e basic
 ```
+
+## toolchain versions (last verified working)
+
+- Python: 3.13.14
+- PlatformIO Core: 6.1.19
+- esptool: 5.3.0 (must be in PATH — see comment in `platformio.ini`)
+- platform (espressif32 / pioarduino): 55.3.311
+  - framework-arduinoespressif32: 3.3.11
+  - framework-arduinoespressif32-libs: 5.5.5+sha.b774170ff46
+  - toolchain-xtensa-esp-elf: 14.2.0+20260121
+
+## windows: fixing "long paths" build errors
+
+On Windows, installing PlatformIO packages (e.g. `framework-arduinoespressif32-libs`, which ships deeply nested Matter/connectedhomeip paths well over 200 characters) can fail with a `FileNotFoundError` while unpacking, unless Windows' long path support is enabled.
+
+Fix (requires admin — this will prompt a UAC dialog):
+
+```powershell
+Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile -Command "New-ItemProperty -Path ''HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem'' -Name LongPathsEnabled -Value 1 -PropertyType DWord -Force | Out-Null"'
+```
+
+Verify it took effect:
+
+```powershell
+reg query "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v LongPathsEnabled
+```
+
+It should print `LongPathsEnabled    REG_DWORD    0x1`. No reboot needed — just re-run the `pio run` command.
