@@ -85,7 +85,6 @@ void setup() {
     cfg.input_device  = ADC_INPUT_LINE1;
     cfg.output_device = DAC_OUTPUT_ALL;
     cfg.is_master     = true;
-    cfg.fixed_mclk = SAMPLE_RATE * 256;  // MCLK = 256*fs = 6.144 MHz per hardware spec
     i2s.begin(cfg);
 
     i2s.setVolume(0.8f);

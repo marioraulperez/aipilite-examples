@@ -46,9 +46,16 @@ Otros entornos disponibles: `basic`, `sound`, `rgb`, `battery`, `pocketjoke`, `r
 
 - **Rutas largas de Windows deshabilitadas** → build fallaba al instalar `framework-arduinoespressif32-libs` (tarball con paths de Matter/connectedhomeip >200 caracteres). Fix: habilitar `LongPathsEnabled` (ver arriba).
 - **`GFX Library for Arduino` (Arduino_GFX) pinneada en `v1.5.9`** era incompatible con el core `arduino-esp32` 3.3.11 (la firma de `spiFrequencyToClockDiv` cambió a `spiFrequencyToClockDiv(spi_t*, uint32_t)`). Fix aplicado: bump del pin a `v1.6.7` en todos los entornos que usan Arduino_GFX (`basic`, `sound`, `battery`, `pocketjoke`, `roboeyes`, `planeradar`) en `platformio.ini`. El entorno `radio` no se tocó porque fija su propia versión de plataforma (`espressif32@7.0.1`), previa al cambio incompatible.
-- **`src/planeradar/hardware/beep.cpp`**: usaba `cfg.fixed_mclk`, campo que no existe en `arduino-audio-tools` `v1.2.4` (la versión pinneada). Se eliminó esa línea.
+- **`src/planeradar/hardware/beep.cpp`** y **`src/sound/main.cpp`**: usaban `cfg.fixed_mclk`, campo que no existe en `arduino-audio-tools` `v1.2.4` (la versión pinneada). Se eliminó esa línea en ambos archivos.
 - **`src/planeradar/services/adsb_client.cpp`**: usaba el tipo `WiFiClient` pero solo incluía `WiFiClientSecure.h`. En el core actual, `WiFiClientSecure.h` es solo un alias (`typedef NetworkClientSecure WiFiClientSecure;`) y ya no trae `WiFiClient` transitivamente. Se agregó `#include <WiFiClient.h>`.
+- **`[env:radio]`** tenía su propia plataforma fijada (`platform = espressif32@7.0.1`) y `Arduino_GFX#v1.5.9`, quedando desalineado del resto. Se quitó el pin de plataforma (hereda la del `[env]` base) y se subió `Arduino_GFX` a `v1.6.7` igual que los demás entornos. El código de `radio` no necesitó cambios, pero al mezclar metadata de la plataforma vieja con la nueva quedó un estado de paquetes inconsistente que rompía el build (`TypeError` en `piobuild.py` por `FRAMEWORK_DIR` en `None`); se resolvió limpiando el build cacheado del entorno:
+
+  ```powershell
+  Remove-Item -Recurse -Force ".pio\build\radio"
+  pio run -e radio
+  ```
 
 ## Estado verificado
 
-Build y flasheo de `planeradar` confirmados funcionando end-to-end (compilación exitosa + `esptool write-flash` con verificación de hash OK) sobre un ESP32-S3 conectado por USB.
+- Build y flasheo de `planeradar` confirmados funcionando end-to-end (compilación exitosa + `esptool write-flash` con verificación de hash OK) sobre un ESP32-S3 conectado por USB.
+- Todos los entornos de `platformio.ini` compilan correctamente y ahora comparten la misma plataforma y versión de `Arduino_GFX`: `basic`, `sound`, `rgb`, `battery`, `pocketjoke`, `roboeyes`, `planeradar`, `radio` (`pio run -e <env>` para cada uno).
