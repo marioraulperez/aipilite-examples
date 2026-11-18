@@ -10,12 +10,14 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
+#include <FastLED.h>
 #include <Arduino_GFX_Library.h>
 #include <PNGdec.h>
 #include "../pins.h"
 
 Arduino_DataBus *bus = new Arduino_ESP32SPI(PIN_LCD_DC, PIN_LCD_CS, PIN_LCD_CLK, PIN_LCD_MOSI);
 Arduino_GFX *lcd = new Arduino_ST7735(bus, PIN_LCD_RST, 3, false, 128, 128, 0, 0);
+static CRGB statusLed[1];
 
 struct Sat {
   const char *id;
@@ -39,6 +41,7 @@ static int satIndex = 0;  // GOES-19
 static const char *kHost = "slider.cira.colostate.edu";
 static const size_t kMaxPng = 900 * 1024;
 static const unsigned long kRefreshMs = 10UL * 60UL * 1000UL;
+static const unsigned long kDefaultCadenceMs = 10UL * 60UL * 1000UL;
 static const unsigned long kLeftHoldMs = 500;
 // Five decoded neighbor frames; plus the display and staging frames (~224 KB total).
 static const int kPrefetchSlots = 5;
@@ -55,6 +58,7 @@ struct CachedFrame {
   uint16_t *pixels;
   int index;
   unsigned long fetchedMs;
+  unsigned long cadenceMs;
   char stamp[15];
 };
 static CachedFrame frameCache[kPrefetchSlots] = {};
@@ -65,6 +69,8 @@ static bool haveFrame = false;
 static int loadedIndex = -1;
 static char loadedStamp[15] = "";
 static unsigned long loadedFetchedMs = 0;
+static unsigned long loadedCadenceMs = kDefaultCadenceMs;
+static unsigned long nextCurrentCheckMs = 0;
 static int failedIndex = -1;
 static uint32_t resizeUs = 0;
 static unsigned long lastFetchMs = 0;
@@ -159,8 +165,47 @@ static void drawSatHeader() {
 
 static void drawCacheDots();
 
+static void updateLedFromFrame(const uint16_t *pixels) {
+  uint32_t luminanceSum = 0;
+  uint32_t validPixels = 0;
+  uint32_t greenPixels = 0;
+  uint32_t bluePixels = 0;
+
+  // Sample every fourth pixel in each direction; ignore near-black space/background.
+  for (int y = 0; y < 128; y += 4) {
+    for (int x = 0; x < 128; x += 4) {
+      uint16_t rgb = __builtin_bswap16(pixels[y * 128 + x]);
+      uint8_t r = ((rgb >> 11) & 0x1f) * 255 / 31;
+      uint8_t g = ((rgb >> 5) & 0x3f) * 255 / 63;
+      uint8_t b = (rgb & 0x1f) * 255 / 31;
+      uint16_t luminance = (uint16_t)(r * 30 + g * 59 + b * 11) / 100;
+      if (luminance < 18) continue;
+      luminanceSum += luminance;
+      validPixels++;
+      if (g > r * 1.15f && g > b * 1.08f && g > 55) greenPixels++;
+      if (b > r * 1.15f && b > g * 1.05f && b > 50) bluePixels++;
+    }
+  }
+
+  CRGB color = CRGB::Blue;
+  if (validPixels) {
+    uint32_t averageLuminance = luminanceSum / validPixels;
+    if (averageLuminance < 78 && bluePixels > greenPixels) {
+      color = CRGB(72, 0, 160);  // dark/night scene: violet
+    } else if (greenPixels * 100 >= validPixels * 4) {
+      color = CRGB::Green;       // noticeable green land/cloud palette
+    } else if (bluePixels > greenPixels) {
+      color = CRGB::Blue;
+    }
+  }
+
+  statusLed[0] = color;
+  FastLED.show();
+}
+
 void pushFrame() {
   lcd->draw16bitBeRGBBitmap(0, 0, frame, 128, 128);
+  updateLedFromFrame(frame);
   drawSatHeader();
   drawCacheDots();
 }
@@ -190,8 +235,10 @@ static void showLoadingFor(int index) {
 static int findCachedFrame(int index) {
   unsigned long now = millis();
   for (int i = 0; i < kPrefetchSlots; i++) {
+    unsigned long ttl = frameCache[i].cadenceMs * 3;
+    if (ttl < kRefreshMs) ttl = kRefreshMs;
     if (i != activePrefetchSlot && frameCache[i].index == index &&
-        now - frameCache[i].fetchedMs < kRefreshMs) return i;
+        now - frameCache[i].fetchedMs < ttl) return i;
   }
   return -1;
 }
@@ -209,10 +256,12 @@ static bool displayCachedFrame(int index) {
   loadedIndex = index;
   memcpy(loadedStamp, frameCache[slot].stamp, sizeof(loadedStamp));
   loadedFetchedMs = frameCache[slot].fetchedMs;
+  loadedCadenceMs = frameCache[slot].cadenceMs;
   loadingStatusIndex = -1;
   failedIndex = -1;
   haveFrame = true;
   lastFetchMs = loadedFetchedMs;
+  nextCurrentCheckMs = millis() + loadedCadenceMs;
   pushFrame();
   Serial.printf("cache hit %s\n", kRing[index].id);
   return true;
@@ -224,7 +273,8 @@ static void retainDisplayedFrame(int nextIndex) {
   int slot = -1;
   for (int i = 0; i < kPrefetchSlots; i++) {
     if (i != activePrefetchSlot &&
-        (frameCache[i].index < 0 || millis() - frameCache[i].fetchedMs >= kRefreshMs)) {
+        (frameCache[i].index < 0 || millis() - frameCache[i].fetchedMs >=
+         (frameCache[i].cadenceMs * 3 > kRefreshMs ? frameCache[i].cadenceMs * 3 : kRefreshMs))) {
       slot = i;
       break;
     }
@@ -247,6 +297,7 @@ static void retainDisplayedFrame(int nextIndex) {
   memcpy(frameCache[slot].pixels, frame, kFrameBytes);
   frameCache[slot].index = loadedIndex;
   frameCache[slot].fetchedMs = loadedFetchedMs;
+  frameCache[slot].cadenceMs = loadedCadenceMs;
   memcpy(frameCache[slot].stamp, loadedStamp, sizeof(frameCache[slot].stamp));
   Serial.printf("cache keep %s\n", kRing[loadedIndex].id);
 }
@@ -389,7 +440,23 @@ static bool httpsOpen(WiFiClientSecure &client, const char *url) {
   return true;
 }
 
-static bool fetchStamp(const Sat &s, char *stamp, uint32_t *fetchMs, uint32_t *parseUs) {
+static int64_t stampToMinutes(const char *stamp) {
+  int year = (stamp[0] - '0') * 1000 + (stamp[1] - '0') * 100 +
+             (stamp[2] - '0') * 10 + stamp[3] - '0';
+  int month = (stamp[4] - '0') * 10 + stamp[5] - '0';
+  int day = (stamp[6] - '0') * 10 + stamp[7] - '0';
+  int hour = (stamp[8] - '0') * 10 + stamp[9] - '0';
+  int minute = (stamp[10] - '0') * 10 + stamp[11] - '0';
+  static const int daysBeforeMonth[] = {0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
+  int priorYears = year - 1;
+  int64_t days = (int64_t)365 * priorYears + priorYears / 4 - priorYears / 100 + priorYears / 400;
+  days += daysBeforeMonth[month] + day - 1;
+  if (month > 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) days++;
+  return ((days * 24 + hour) * 60) + minute;
+}
+
+static bool fetchStamp(const Sat &s, char *stamp, uint32_t *fetchMs, uint32_t *parseUs,
+                       unsigned long *cadenceMs) {
   uint32_t fetchStart = millis();
   char url[256];
   timeListUrl(s, url, sizeof(url));
@@ -441,30 +508,41 @@ static bool fetchStamp(const Sat &s, char *stamp, uint32_t *fetchMs, uint32_t *p
   body[got] = 0;
 
   uint32_t parseStart = micros();
+  char candidates[2][15] = {};
+  int candidateCount = 0;
   int digits = 0;
-  bool found = false;
-  for (size_t i = 0; i < got && !found; i++) {
+  char run[15];
+  for (size_t i = 0; i < got && candidateCount < 2; i++) {
     int c = (uint8_t)body[i];
     if (c >= '0' && c <= '9') {
-      if (digits < 14) stamp[digits] = (char)c;
+      if (digits < 14) run[digits] = (char)c;
       digits++;
     } else {
       if (digits == 14) {
-        stamp[14] = 0;
-        found = true;
-        break;
+        run[14] = 0;
+        memcpy(candidates[candidateCount++], run, sizeof(run));
       }
       digits = 0;
     }
   }
-  if (!found && digits == 14) {
-    stamp[14] = 0;
-    found = true;
+  if (candidateCount < 2 && digits == 14) {
+    run[14] = 0;
+    memcpy(candidates[candidateCount++], run, sizeof(run));
   }
   *parseUs = micros() - parseStart;
   free(body);
-  if (found) Serial.printf("stamp %s\n", stamp);
-  return found;
+  if (candidateCount == 0) return false;
+
+  memcpy(stamp, candidates[0], sizeof(candidates[0]));
+  *cadenceMs = kDefaultCadenceMs;
+  if (candidateCount > 1) {
+    int64_t deltaMinutes = stampToMinutes(candidates[0]) - stampToMinutes(candidates[1]);
+    if (deltaMinutes >= 1 && deltaMinutes <= 120) {
+      *cadenceMs = (unsigned long)deltaMinutes * 60UL * 1000UL;
+    }
+  }
+  Serial.printf("stamp %s cadence=%lu min\n", stamp, (unsigned long)(*cadenceMs / 60000UL));
+  return true;
 }
 
 static bool fetchPng(const Sat &s, const char *stamp, uint8_t **outBuf, int *outLen, uint32_t *fetchMs) {
@@ -575,7 +653,8 @@ static bool decodeToFrame(uint8_t *pngBuf, int pngLen, uint16_t *target,
   return rc == PNG_SUCCESS;
 }
 
-static bool loadSatellite(int i, uint16_t *target, bool displayWhenReady, char *stampOut) {
+static bool loadSatellite(int i, uint16_t *target, bool displayWhenReady,
+                          char *stampOut, unsigned long *cadenceOut) {
   const Sat &s = kRing[i];
   uint32_t totalStart = millis();
   uint32_t jsonFetchMs = 0, jsonParseUs = 0, imageFetchMs = 0;
@@ -583,8 +662,10 @@ static bool loadSatellite(int i, uint16_t *target, bool displayWhenReady, char *
   Serial.printf("load %s\n", s.id);
 
   char stamp[15];
-  if (!fetchStamp(s, stamp, &jsonFetchMs, &jsonParseUs)) return false;
+  unsigned long cadenceMs = kDefaultCadenceMs;
+  if (!fetchStamp(s, stamp, &jsonFetchMs, &jsonParseUs, &cadenceMs)) return false;
   if (stampOut) memcpy(stampOut, stamp, sizeof(stamp));
+  if (cadenceOut) *cadenceOut = cadenceMs;
 
   uint8_t *pngBuf = nullptr;
   int pngLen = 0;
@@ -618,14 +699,16 @@ static void loadUntilCaughtUp() {
     bool ok;
     char stamp[15] = "";
     unsigned long frameFetchedAt = 0;
+    unsigned long frameCadenceMs = kDefaultCadenceMs;
     if (cached >= 0) {
       ok = displayCachedFrame(started);
       if (ok) {
         memcpy(stamp, loadedStamp, sizeof(stamp));
         frameFetchedAt = loadedFetchedMs;
+        frameCadenceMs = loadedCadenceMs;
       }
     } else {
-      ok = loadSatellite(started, stagingFrame, false, stamp);
+      ok = loadSatellite(started, stagingFrame, false, stamp, &frameCadenceMs);
       if (ok) frameFetchedAt = millis();
     }
     if (ok && satIndex == started) {
@@ -633,10 +716,12 @@ static void loadUntilCaughtUp() {
       loadedIndex = started;
       memcpy(loadedStamp, stamp, sizeof(loadedStamp));
       loadedFetchedMs = frameFetchedAt;
+      loadedCadenceMs = frameCadenceMs;
       loadingStatusIndex = -1;
       pushFrame();
       haveFrame = true;
       lastFetchMs = loadedFetchedMs;
+      nextCurrentCheckMs = millis() + loadedCadenceMs;
       failedIndex = -1;
     } else if (!ok) {
       failedIndex = started;
@@ -675,7 +760,9 @@ static void prefetchOneNeighbor() {
 
   int slot = -1;
   for (int i = 0; i < kPrefetchSlots; i++) {
-    if (frameCache[i].index < 0 || millis() - frameCache[i].fetchedMs >= kRefreshMs) {
+    unsigned long ttl = frameCache[i].cadenceMs * 3;
+    if (ttl < kRefreshMs) ttl = kRefreshMs;
+    if (frameCache[i].index < 0 || millis() - frameCache[i].fetchedMs >= ttl) {
       slot = i;
       break;
     }
@@ -697,11 +784,13 @@ static void prefetchOneNeighbor() {
   fetching = true;
   Serial.printf("prefetch %s\n", kRing[target].id);
   char stamp[15] = "";
-  bool ok = loadSatellite(target, frameCache[slot].pixels, false, stamp);
+  unsigned long cadenceMs = kDefaultCadenceMs;
+  bool ok = loadSatellite(target, frameCache[slot].pixels, false, stamp, &cadenceMs);
   activePrefetchSlot = -1;
   if (ok) {
     frameCache[slot].index = target;
     frameCache[slot].fetchedMs = millis();
+    frameCache[slot].cadenceMs = cadenceMs;
     memcpy(frameCache[slot].stamp, stamp, sizeof(frameCache[slot].stamp));
     drawCacheDots();
     prefetchFailedIndex = -1;
@@ -711,6 +800,75 @@ static void prefetchOneNeighbor() {
     prefetchFailedIndex = target;
     prefetchFailedMs = millis();
   }
+  fetching = false;
+}
+
+static void checkCurrentSatellite() {
+  if (loadedIndex < 0 || loadedIndex != satIndex || fetching || WiFi.status() != WL_CONNECTED) return;
+  const int checkedIndex = loadedIndex;
+  const Sat &s = kRing[checkedIndex];
+  uint32_t jsonMs = 0, parseUs = 0, imageMs = 0, decodeMs = 0, resizeTimeUs = 0;
+  unsigned long cadenceMs = loadedCadenceMs;
+  char latestStamp[15] = "";
+
+  fetching = true;
+  Serial.printf("check %s\n", s.id);
+  if (!fetchStamp(s, latestStamp, &jsonMs, &parseUs, &cadenceMs)) {
+    nextCurrentCheckMs = millis() + 60000UL;
+    fetching = false;
+    return;
+  }
+  if (loadedIndex != checkedIndex || satIndex != checkedIndex) {
+    fetching = false;
+    return;
+  }
+
+  if (strcmp(latestStamp, loadedStamp) == 0) {
+    loadedCadenceMs = cadenceMs;
+    int cached = findCachedFrame(checkedIndex);
+    if (cached >= 0) frameCache[cached].cadenceMs = cadenceMs;
+    nextCurrentCheckMs = millis() + cadenceMs;
+    Serial.printf("unchanged %s next-check=%lu min\n", s.id,
+                  (unsigned long)(cadenceMs / 60000UL));
+    fetching = false;
+    return;
+  }
+
+  Serial.printf("changed %s %s -> %s\n", s.id, loadedStamp, latestStamp);
+  uint8_t *pngBuf = nullptr;
+  int pngLen = 0;
+  if (!fetchPng(s, latestStamp, &pngBuf, &pngLen, &imageMs)) {
+    nextCurrentCheckMs = millis() + 60000UL;
+    fetching = false;
+    return;
+  }
+
+  bool ok = decodeToFrame(pngBuf, pngLen, stagingFrame, &decodeMs, &resizeTimeUs);
+  free(pngBuf);
+  Serial.printf("refresh-time %s json=%lu ms parse=%lu us img=%lu ms decode=%lu ms resize=%lu us\n",
+    s.id, (unsigned long)jsonMs, (unsigned long)parseUs,
+    (unsigned long)imageMs, (unsigned long)decodeMs, (unsigned long)resizeTimeUs);
+
+  if (ok && loadedIndex == checkedIndex && satIndex == checkedIndex) {
+    memcpy(frame, stagingFrame, kFrameBytes);
+    memcpy(loadedStamp, latestStamp, sizeof(loadedStamp));
+    loadedFetchedMs = millis();
+    loadedCadenceMs = cadenceMs;
+    lastFetchMs = loadedFetchedMs;
+    int cached = findCachedFrame(checkedIndex);
+    if (cached >= 0) {
+      memcpy(frameCache[cached].pixels, frame, kFrameBytes);
+      memcpy(frameCache[cached].stamp, loadedStamp, sizeof(frameCache[cached].stamp));
+      frameCache[cached].fetchedMs = loadedFetchedMs;
+      frameCache[cached].cadenceMs = loadedCadenceMs;
+    }
+    pushFrame();
+    Serial.printf("refreshed %s\n", s.id);
+  } else if (!ok) {
+    Serial.printf("refresh decode failed %s\n", s.id);
+    nextCurrentCheckMs = millis() + 60000UL;
+  }
+  if (ok) nextCurrentCheckMs = millis() + cadenceMs;
   fetching = false;
 }
 
@@ -832,6 +990,11 @@ void setup() {
   pinMode(PIN_BTN_A, INPUT_PULLUP);
   pinMode(PIN_BTN_B, INPUT_PULLUP);
 
+  FastLED.addLeds<WS2812, PIN_RGB_LED, GRB>(statusLed, 1);
+  FastLED.setBrightness(28);
+  statusLed[0] = CRGB::Blue;
+  FastLED.show();
+
   Serial.begin(115200);
 
   lcd->begin();
@@ -895,12 +1058,13 @@ void loop() {
     need = !(satIndex == failedIndex && now - lastAttemptMs < 5000);
   } else if (!haveFrame) {
     need = now - lastAttemptMs > 5000;
-  } else if (now - lastFetchMs >= kRefreshMs) {
-    need = now - lastAttemptMs > 5000;
   }
   if (need && !fetching) {
     lastAttemptMs = now;
     loadUntilCaughtUp();
+  } else if (loadedIndex == satIndex && haveFrame &&
+             (int32_t)(now - nextCurrentCheckMs) >= 0) {
+    checkCurrentSatellite();
   } else if (!need && loadedIndex == satIndex && haveFrame) {
     prefetchOneNeighbor();
   }
