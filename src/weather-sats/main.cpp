@@ -53,12 +53,14 @@ struct CachedFrame {
   uint16_t *pixels;
   int index;
   unsigned long fetchedMs;
+  char stamp[15];
 };
 static CachedFrame frameCache[kPrefetchSlots] = {};
 static PNG png;
 static bool fetching = false;
 static bool haveFrame = false;
 static int loadedIndex = -1;
+static char loadedStamp[15] = "";
 static int failedIndex = -1;
 static uint32_t resizeUs = 0;
 static unsigned long lastFetchMs = 0;
@@ -100,25 +102,78 @@ static const char *urlPath(const char *url) {
   return p ? p : "/";
 }
 
+static int weekdaySunday0(int year, int month, int day) {
+  static const int offsets[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+  if (month < 3) year--;
+  return (year + year / 4 - year / 100 + year / 400 + offsets[month - 1] + day) % 7;
+}
+
+static void formatPacificTime(const char *stamp, char *out, size_t outSize) {
+  int year = (stamp[0] - '0') * 1000 + (stamp[1] - '0') * 100 +
+             (stamp[2] - '0') * 10 + stamp[3] - '0';
+  int month = (stamp[4] - '0') * 10 + stamp[5] - '0';
+  int day = (stamp[6] - '0') * 10 + stamp[7] - '0';
+  int hour = (stamp[8] - '0') * 10 + stamp[9] - '0';
+  int minute = (stamp[10] - '0') * 10 + stamp[11] - '0';
+  bool daylight = false;
+
+  if (month > 3 && month < 11) {
+    daylight = true;
+  } else if (month == 3) {
+    int firstSunday = 1 + ((7 - weekdaySunday0(year, 3, 1)) % 7);
+    int secondSunday = firstSunday + 7;
+    daylight = day > secondSunday || (day == secondSunday && hour >= 10); // 02:00 PST
+  } else if (month == 11) {
+    int firstSunday = 1 + ((7 - weekdaySunday0(year, 11, 1)) % 7);
+    daylight = day < firstSunday || (day == firstSunday && hour < 9); // 02:00 PDT
+  }
+
+  int localMinutes = hour * 60 + minute - (daylight ? 7 * 60 : 8 * 60);
+  if (localMinutes < 0) localMinutes += 24 * 60;
+  snprintf(out, outSize, "%02d:%02d", localMinutes / 60, localMinutes % 60);
+}
+
+static void drawSatHeader() {
+  if (loadedIndex < 0 || !loadedStamp[0]) return;
+  lcd->setTextColor(RGB565_WHITE);
+  lcd->setTextSize(1);
+  const char *name = kRing[loadedIndex].id;
+  int nameWidth = (int)strlen(name) * 6 + 4;
+  lcd->fillRect(0, 0, nameWidth, 10, RGB565_BLACK);
+  lcd->setCursor(2, 1);
+  lcd->print(name);
+
+  char timeText[6];
+  formatPacificTime(loadedStamp, timeText, sizeof(timeText));
+  int timeBoxWidth = (int)strlen(timeText) * 6 + 4;
+  int timeBoxX = 128 - timeBoxWidth;
+  lcd->fillRect(timeBoxX, 0, timeBoxWidth, 10, RGB565_BLACK);
+  int timeX = timeBoxX + 2;
+  lcd->setCursor(timeX, 1);
+  lcd->print(timeText);
+}
+
+static void drawCacheDots();
+
 void pushFrame() {
   lcd->draw16bitBeRGBBitmap(0, 0, frame, 128, 128);
+  drawSatHeader();
+  drawCacheDots();
 }
 
 static void drawLoadingIndicator() {
   if (loadingStatusIndex < 0) return;
   if (haveFrame) {
-    lcd->fillRect(0, 0, 128, 22, RGB565_BLACK);
+    lcd->fillRect(34, 118, 60, 10, RGB565_BLACK);
   } else {
     lcd->fillScreen(RGB565_BLACK);
   }
   lcd->setTextColor(RGB565_WHITE);
   lcd->setTextSize(1);
-  lcd->setCursor(3, 2);
-  lcd->print("Loading...");
-  lcd->setCursor(3, 12);
-  lcd->print(kRing[loadingStatusIndex].id);
-  lcd->print(" ");
+  lcd->setCursor(36, 119);
+  lcd->print("Loading");
   for (int i = 0; i < loadingDots; i++) lcd->print('.');
+  drawCacheDots();
 }
 
 static void showLoadingFor(int index) {
@@ -134,6 +189,20 @@ static int findCachedFrame(int index) {
     if (frameCache[i].index == index && now - frameCache[i].fetchedMs < kRefreshMs) return i;
   }
   return -1;
+}
+
+static void drawCacheDots() {
+  int focus = (loadingStatusIndex >= 0) ? loadingStatusIndex : loadedIndex;
+  if (focus < 0) return;
+  lcd->fillCircle(3, 124, 3, RGB565_BLACK);
+  lcd->fillCircle(124, 124, 3, RGB565_BLACK);
+  uint16_t color = RGB565_WHITE;
+  if (findCachedFrame((focus + kCount - 1) % kCount) >= 0) {
+    lcd->fillCircle(3, 124, 2, color);
+  }
+  if (findCachedFrame((focus + 1) % kCount) >= 0) {
+    lcd->fillCircle(124, 124, 2, color);
+  }
 }
 
 void showMessage(const char *msg) {
@@ -438,7 +507,7 @@ static bool decodeToFrame(uint8_t *pngBuf, int pngLen, uint16_t *target,
   return rc == PNG_SUCCESS;
 }
 
-static bool loadSatellite(int i, uint16_t *target, bool displayWhenReady) {
+static bool loadSatellite(int i, uint16_t *target, bool displayWhenReady, char *stampOut) {
   const Sat &s = kRing[i];
   uint32_t totalStart = millis();
   uint32_t jsonFetchMs = 0, jsonParseUs = 0, imageFetchMs = 0;
@@ -447,6 +516,7 @@ static bool loadSatellite(int i, uint16_t *target, bool displayWhenReady) {
 
   char stamp[15];
   if (!fetchStamp(s, stamp, &jsonFetchMs, &jsonParseUs)) return false;
+  if (stampOut) memcpy(stampOut, stamp, sizeof(stamp));
 
   uint8_t *pngBuf = nullptr;
   int pngLen = 0;
@@ -478,19 +548,22 @@ static void loadUntilCaughtUp() {
     showLoadingFor(started);
     int cached = findCachedFrame(started);
     bool ok;
+    char stamp[15] = "";
     if (cached >= 0) {
       Serial.printf("cache hit %s\n", kRing[started].id);
       memcpy(frame, frameCache[cached].pixels, kFrameBytes);
+      memcpy(stamp, frameCache[cached].stamp, sizeof(stamp));
       ok = true;
     } else {
-      ok = loadSatellite(started, frame, false);
+      ok = loadSatellite(started, frame, false, stamp);
     }
     if (ok && satIndex == started) {
+      loadedIndex = started;
+      memcpy(loadedStamp, stamp, sizeof(loadedStamp));
+      loadingStatusIndex = -1;
       pushFrame();
       haveFrame = true;
-      loadingStatusIndex = -1;
       lastFetchMs = millis();
-      loadedIndex = started;
       failedIndex = -1;
     } else if (!ok) {
       failedIndex = started;
@@ -521,10 +594,13 @@ static void prefetchOneNeighbor() {
   }
   fetching = true;
   Serial.printf("prefetch %s\n", kRing[target].id);
-  bool ok = loadSatellite(target, frameCache[slot].pixels, false);
+  char stamp[15] = "";
+  bool ok = loadSatellite(target, frameCache[slot].pixels, false, stamp);
   if (ok) {
     frameCache[slot].index = target;
     frameCache[slot].fetchedMs = millis();
+    memcpy(frameCache[slot].stamp, stamp, sizeof(frameCache[slot].stamp));
+    drawCacheDots();
     prefetchFailedIndex = -1;
     Serial.printf("cached %s\n", kRing[target].id);
   } else {
