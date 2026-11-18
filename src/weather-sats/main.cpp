@@ -40,19 +40,34 @@ static const char *kHost = "slider.cira.colostate.edu";
 static const size_t kMaxPng = 900 * 1024;
 static const unsigned long kRefreshMs = 10UL * 60UL * 1000UL;
 static const unsigned long kLeftHoldMs = 500;
+static const int kPrefetchSlots = 2;
+static const size_t kFrameBytes = 128 * 128 * sizeof(uint16_t);
 
 // PNGdec RGB565_BIG_ENDIAN + draw16bitBeRGBBitmap. Switch to LITTLE_ENDIAN +
 // draw16bitRGBBitmap if red/blue are swapped on this panel.
 #define PNG_ENDIAN PNG_RGB565_BIG_ENDIAN
 
 static uint16_t *frame = nullptr;  // 128×128 RGB565 in PSRAM
+static uint16_t *decodeFrame = nullptr;
+struct CachedFrame {
+  uint16_t *pixels;
+  int index;
+  unsigned long fetchedMs;
+};
+static CachedFrame frameCache[kPrefetchSlots] = {};
 static PNG png;
 static bool fetching = false;
 static bool haveFrame = false;
 static int loadedIndex = -1;
 static int failedIndex = -1;
+static uint32_t resizeUs = 0;
 static unsigned long lastFetchMs = 0;
 static unsigned long lastAttemptMs = 0;
+static unsigned long lastStatusMs = 0;
+static int loadingStatusIndex = -1;
+static uint8_t loadingDots = 0;
+static int prefetchFailedIndex = -1;
+static unsigned long prefetchFailedMs = 0;
 
 Preferences prefs;
 WebServer server(80);
@@ -89,6 +104,38 @@ void pushFrame() {
   lcd->draw16bitBeRGBBitmap(0, 0, frame, 128, 128);
 }
 
+static void drawLoadingIndicator() {
+  if (loadingStatusIndex < 0) return;
+  if (haveFrame) {
+    lcd->fillRect(0, 0, 128, 22, RGB565_BLACK);
+  } else {
+    lcd->fillScreen(RGB565_BLACK);
+  }
+  lcd->setTextColor(RGB565_WHITE);
+  lcd->setTextSize(1);
+  lcd->setCursor(3, 2);
+  lcd->print("Loading...");
+  lcd->setCursor(3, 12);
+  lcd->print(kRing[loadingStatusIndex].id);
+  lcd->print(" ");
+  for (int i = 0; i < loadingDots; i++) lcd->print('.');
+}
+
+static void showLoadingFor(int index) {
+  loadingStatusIndex = index;
+  loadingDots = 0;
+  lastStatusMs = millis();
+  drawLoadingIndicator();
+}
+
+static int findCachedFrame(int index) {
+  unsigned long now = millis();
+  for (int i = 0; i < kPrefetchSlots; i++) {
+    if (frameCache[i].index == index && now - frameCache[i].fetchedMs < kRefreshMs) return i;
+  }
+  return -1;
+}
+
 void showMessage(const char *msg) {
   lcd->fillScreen(RGB565_BLACK);
   lcd->setTextColor(RGB565_WHITE);
@@ -120,6 +167,7 @@ static void serviceButtons() {
         if (!leftHoldIgnored && now - leftDownMs < kLeftHoldMs) {
           satIndex = (satIndex + 7) % kCount;
           Serial.printf("sat <- %s\n", kRing[satIndex].id);
+          showLoadingFor(satIndex);
         }
       }
     }
@@ -139,10 +187,17 @@ static void serviceButtons() {
       if (rightStable == LOW) {
         satIndex = (satIndex + 1) % kCount;
         Serial.printf("sat -> %s\n", kRing[satIndex].id);
+        showLoadingFor(satIndex);
       }
     }
   } else {
     rightEdgeMs = 0;
+  }
+
+  if (fetching && loadingStatusIndex >= 0 && now - lastStatusMs >= 300) {
+    loadingDots = (loadingDots + 1) % 4;
+    lastStatusMs = now;
+    drawLoadingIndicator();
   }
 }
 
@@ -197,7 +252,8 @@ static bool httpsOpen(WiFiClientSecure &client, const char *url) {
   return true;
 }
 
-static bool fetchStamp(const Sat &s, char *stamp) {
+static bool fetchStamp(const Sat &s, char *stamp, uint32_t *fetchMs, uint32_t *parseUs) {
+  uint32_t fetchStart = millis();
   char url[256];
   timeListUrl(s, url, sizeof(url));
 
@@ -211,20 +267,47 @@ static bool fetchStamp(const Sat &s, char *stamp) {
     client.stop();
     return false;
   }
+  if (clen == 0 || clen > 32768) {
+    Serial.printf("json length %u refused\n", (unsigned)clen);
+    client.stop();
+    return false;
+  }
 
+  char *body = (char *)ps_malloc(clen + 1);
+  if (!body) {
+    Serial.println("json ps_malloc fail");
+    client.stop();
+    return false;
+  }
+
+  size_t got = 0;
+  unsigned long bodyStart = millis();
+  while (got < clen && millis() - bodyStart < 10000) {
+    serviceButtons();
+    int n = client.read((uint8_t *)body + got, clen - got);
+    if (n > 0) {
+      got += (size_t)n;
+      bodyStart = millis();
+    } else if (!client.connected() && !client.available()) {
+      break;
+    } else {
+      delay(1);
+    }
+  }
+  client.stop();
+  *fetchMs = millis() - fetchStart;
+  if (got != clen) {
+    Serial.printf("json short %u/%u\n", (unsigned)got, (unsigned)clen);
+    free(body);
+    return false;
+  }
+  body[got] = 0;
+
+  uint32_t parseStart = micros();
   int digits = 0;
   bool found = false;
-  unsigned long t0 = millis();
-  while (!found && millis() - t0 < 10000) {
-    serviceButtons();
-    int avail = client.available();
-    if (avail <= 0) {
-      if (!client.connected()) break;
-      delay(1);
-      continue;
-    }
-    int c = client.read();
-    if (c < 0) continue;
+  for (size_t i = 0; i < got && !found; i++) {
+    int c = (uint8_t)body[i];
     if (c >= '0' && c <= '9') {
       if (digits < 14) stamp[digits] = (char)c;
       digits++;
@@ -241,12 +324,14 @@ static bool fetchStamp(const Sat &s, char *stamp) {
     stamp[14] = 0;
     found = true;
   }
-  client.stop();
+  *parseUs = micros() - parseStart;
+  free(body);
   if (found) Serial.printf("stamp %s\n", stamp);
   return found;
 }
 
-static bool fetchPng(const Sat &s, const char *stamp, uint8_t **outBuf, int *outLen) {
+static bool fetchPng(const Sat &s, const char *stamp, uint8_t **outBuf, int *outLen, uint32_t *fetchMs) {
+  uint32_t fetchStart = millis();
   char url[320];
   tileUrl(s, stamp, url, sizeof(url));
 
@@ -296,14 +381,19 @@ static bool fetchPng(const Sat &s, const char *stamp, uint8_t **outBuf, int *out
   }
   *outBuf = buf;
   *outLen = (int)clen;
+  *fetchMs = millis() - fetchStart;
   Serial.printf("png %u bytes\n", (unsigned)clen);
   return true;
 }
 
 int onLine(PNGDRAW *p) {
+  uint32_t resizeStart = micros();
   int dstY = (int)((int32_t)p->y * 128 / png.getHeight());
   int prev = (int)((int32_t)(p->y - 1) * 128 / png.getHeight());
-  if (p->y > 0 && dstY == prev) return 1;
+  if (p->y > 0 && dstY == prev) {
+    resizeUs += micros() - resizeStart;
+    return 1;
+  }
 
   uint16_t line[700];
   png.getLineAsRGB565(p, line, PNG_ENDIAN, 0x00000000);
@@ -311,15 +401,22 @@ int onLine(PNGDRAW *p) {
   if (srcW > 700) srcW = 700;
   for (int x = 0; x < 128; x++) {
     int sx = (int)((int32_t)x * srcW / 128);
-    frame[dstY * 128 + x] = line[sx];
+    decodeFrame[dstY * 128 + x] = line[sx];
   }
+  resizeUs += micros() - resizeStart;
   return 1;
 }
 
-static bool decodeToFrame(uint8_t *pngBuf, int pngLen) {
+static bool decodeToFrame(uint8_t *pngBuf, int pngLen, uint16_t *target,
+                          uint32_t *decodeMs, uint32_t *resizeTimeUs) {
+  uint32_t decodeStart = millis();
+  resizeUs = 0;
+  decodeFrame = target;
   int openRc = png.openRAM(pngBuf, pngLen, onLine);
   if (openRc != PNG_SUCCESS) {
     Serial.printf("png open rc=%d err=%d\n", openRc, png.getLastError());
+    *decodeMs = millis() - decodeStart;
+    *resizeTimeUs = resizeUs;
     return false;
   }
   int w = png.getWidth();
@@ -327,6 +424,8 @@ static bool decodeToFrame(uint8_t *pngBuf, int pngLen) {
   if (w <= 0 || w > 700 || h <= 0) {
     Serial.printf("png size refused %dx%d\n", w, h);
     png.close();
+    *decodeMs = millis() - decodeStart;
+    *resizeTimeUs = resizeUs;
     return false;
   }
   int rc = png.decode(NULL, 0);
@@ -334,28 +433,40 @@ static bool decodeToFrame(uint8_t *pngBuf, int pngLen) {
     Serial.printf("png decode rc=%d err=%d\n", rc, png.getLastError());
   }
   png.close();
+  *decodeMs = millis() - decodeStart;
+  *resizeTimeUs = resizeUs;
   return rc == PNG_SUCCESS;
 }
 
-static bool loadSatellite(int i) {
+static bool loadSatellite(int i, uint16_t *target, bool displayWhenReady) {
   const Sat &s = kRing[i];
+  uint32_t totalStart = millis();
+  uint32_t jsonFetchMs = 0, jsonParseUs = 0, imageFetchMs = 0;
+  uint32_t decodeMs = 0, resizeTimeUs = 0;
   Serial.printf("load %s\n", s.id);
 
   char stamp[15];
-  if (!fetchStamp(s, stamp)) return false;
+  if (!fetchStamp(s, stamp, &jsonFetchMs, &jsonParseUs)) return false;
 
   uint8_t *pngBuf = nullptr;
   int pngLen = 0;
-  if (!fetchPng(s, stamp, &pngBuf, &pngLen)) return false;
+  if (!fetchPng(s, stamp, &pngBuf, &pngLen, &imageFetchMs)) return false;
 
-  bool ok = decodeToFrame(pngBuf, pngLen);
+  bool ok = decodeToFrame(pngBuf, pngLen, target, &decodeMs, &resizeTimeUs);
   free(pngBuf);
+  Serial.printf("time %s json=%lu ms parse=%lu us img=%lu ms decode=%lu ms resize=%lu us total=%lu ms\n",
+    s.id, (unsigned long)jsonFetchMs, (unsigned long)jsonParseUs,
+    (unsigned long)imageFetchMs, (unsigned long)decodeMs,
+    (unsigned long)resizeTimeUs, (unsigned long)(millis() - totalStart));
   if (!ok) {
     Serial.println("png decode fail");
     return false;
   }
-  pushFrame();
-  haveFrame = true;
+  if (displayWhenReady) {
+    pushFrame();
+    haveFrame = true;
+    loadingStatusIndex = -1;
+  }
   return true;
 }
 
@@ -364,21 +475,62 @@ static void loadUntilCaughtUp() {
   int started;
   do {
     started = satIndex;
-    if (!haveFrame) {
-      char msg[40];
-      snprintf(msg, sizeof(msg), "Loading\n%s", kRing[started].id);
-      showMessage(msg);
+    showLoadingFor(started);
+    int cached = findCachedFrame(started);
+    bool ok;
+    if (cached >= 0) {
+      Serial.printf("cache hit %s\n", kRing[started].id);
+      memcpy(frame, frameCache[cached].pixels, kFrameBytes);
+      ok = true;
+    } else {
+      ok = loadSatellite(started, frame, false);
     }
-    if (loadSatellite(started)) {
+    if (ok && satIndex == started) {
+      pushFrame();
+      haveFrame = true;
+      loadingStatusIndex = -1;
       lastFetchMs = millis();
       loadedIndex = started;
       failedIndex = -1;
-    } else {
+    } else if (!ok) {
       failedIndex = started;
       if (!haveFrame) showMessage("Fetch failed");
     }
     // If a press arrived mid-download, satIndex moved; fetch that one next.
   } while (satIndex != started);
+  fetching = false;
+}
+
+static void prefetchOneNeighbor() {
+  if (loadedIndex < 0 || fetching || !frameCache[0].pixels || !frameCache[1].pixels) return;
+  int candidates[2] = {(loadedIndex + 1) % kCount, (loadedIndex + kCount - 1) % kCount};
+  int target = -1;
+  for (int i = 0; i < 2; i++) {
+    if (findCachedFrame(candidates[i]) < 0 &&
+        !(prefetchFailedIndex == candidates[i] && millis() - prefetchFailedMs < 60000)) {
+      target = candidates[i];
+      break;
+    }
+  }
+  if (target < 0) return;
+
+  int slot = 0;
+  if (frameCache[0].index >= 0 &&
+      (frameCache[1].index < 0 || frameCache[1].fetchedMs < frameCache[0].fetchedMs)) {
+    slot = 1;
+  }
+  fetching = true;
+  Serial.printf("prefetch %s\n", kRing[target].id);
+  bool ok = loadSatellite(target, frameCache[slot].pixels, false);
+  if (ok) {
+    frameCache[slot].index = target;
+    frameCache[slot].fetchedMs = millis();
+    prefetchFailedIndex = -1;
+    Serial.printf("cached %s\n", kRing[target].id);
+  } else {
+    prefetchFailedIndex = target;
+    prefetchFailedMs = millis();
+  }
   fetching = false;
 }
 
@@ -514,6 +666,15 @@ void setup() {
     showMessage("PSRAM fail");
     while (true) delay(1000);
   }
+  for (int i = 0; i < kPrefetchSlots; i++) {
+    frameCache[i].pixels = (uint16_t *)ps_malloc(kFrameBytes);
+    frameCache[i].index = -1;
+    frameCache[i].fetchedMs = 0;
+    if (!frameCache[i].pixels) {
+      showMessage("PSRAM cache fail");
+      while (true) delay(1000);
+    }
+  }
 
   loadConfiguration();
   delay(50);
@@ -559,6 +720,8 @@ void loop() {
   if (need && !fetching) {
     lastAttemptMs = now;
     loadUntilCaughtUp();
+  } else if (!need && loadedIndex == satIndex && haveFrame) {
+    prefetchOneNeighbor();
   }
   delay(10);
 }
