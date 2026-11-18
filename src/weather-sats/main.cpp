@@ -48,6 +48,7 @@ static const size_t kFrameBytes = 128 * 128 * sizeof(uint16_t);
 #define PNG_ENDIAN PNG_RGB565_BIG_ENDIAN
 
 static uint16_t *frame = nullptr;  // 128×128 RGB565 in PSRAM
+static uint16_t *stagingFrame = nullptr;  // Decode here so the displayed frame stays intact until success.
 static uint16_t *decodeFrame = nullptr;
 struct CachedFrame {
   uint16_t *pixels;
@@ -191,6 +192,21 @@ static int findCachedFrame(int index) {
   return -1;
 }
 
+static bool displayCachedFrame(int index) {
+  int slot = findCachedFrame(index);
+  if (slot < 0) return false;
+  memcpy(frame, frameCache[slot].pixels, kFrameBytes);
+  loadedIndex = index;
+  memcpy(loadedStamp, frameCache[slot].stamp, sizeof(loadedStamp));
+  loadingStatusIndex = -1;
+  failedIndex = -1;
+  haveFrame = true;
+  lastFetchMs = millis();
+  pushFrame();
+  Serial.printf("cache hit %s\n", kRing[index].id);
+  return true;
+}
+
 static void drawCacheDots() {
   int focus = (loadingStatusIndex >= 0) ? loadingStatusIndex : loadedIndex;
   if (focus < 0) return;
@@ -236,7 +252,9 @@ static void serviceButtons() {
         if (!leftHoldIgnored && now - leftDownMs < kLeftHoldMs) {
           satIndex = (satIndex + 7) % kCount;
           Serial.printf("sat <- %s\n", kRing[satIndex].id);
-          showLoadingFor(satIndex);
+          if (!displayCachedFrame(satIndex)) {
+            showLoadingFor(satIndex);
+          }
         }
       }
     }
@@ -256,7 +274,9 @@ static void serviceButtons() {
       if (rightStable == LOW) {
         satIndex = (satIndex + 1) % kCount;
         Serial.printf("sat -> %s\n", kRing[satIndex].id);
-        showLoadingFor(satIndex);
+        if (!displayCachedFrame(satIndex)) {
+          showLoadingFor(satIndex);
+        }
       }
     }
   } else {
@@ -545,19 +565,18 @@ static void loadUntilCaughtUp() {
   int started;
   do {
     started = satIndex;
-    showLoadingFor(started);
     int cached = findCachedFrame(started);
+    if (cached < 0) showLoadingFor(started);
     bool ok;
     char stamp[15] = "";
     if (cached >= 0) {
-      Serial.printf("cache hit %s\n", kRing[started].id);
-      memcpy(frame, frameCache[cached].pixels, kFrameBytes);
-      memcpy(stamp, frameCache[cached].stamp, sizeof(stamp));
-      ok = true;
+      ok = displayCachedFrame(started);
+      if (ok) memcpy(stamp, loadedStamp, sizeof(stamp));
     } else {
-      ok = loadSatellite(started, frame, false, stamp);
+      ok = loadSatellite(started, stagingFrame, false, stamp);
     }
     if (ok && satIndex == started) {
+      if (cached < 0) memcpy(frame, stagingFrame, kFrameBytes);
       loadedIndex = started;
       memcpy(loadedStamp, stamp, sizeof(loadedStamp));
       loadingStatusIndex = -1;
@@ -738,7 +757,8 @@ void setup() {
   lcd->setTextSize(1);
 
   frame = (uint16_t *)ps_malloc(128 * 128 * sizeof(uint16_t));
-  if (!frame) {
+  stagingFrame = (uint16_t *)ps_malloc(kFrameBytes);
+  if (!frame || !stagingFrame) {
     showMessage("PSRAM fail");
     while (true) delay(1000);
   }
