@@ -40,7 +40,8 @@ static const char *kHost = "slider.cira.colostate.edu";
 static const size_t kMaxPng = 900 * 1024;
 static const unsigned long kRefreshMs = 10UL * 60UL * 1000UL;
 static const unsigned long kLeftHoldMs = 500;
-static const int kPrefetchSlots = 2;
+// Five decoded neighbor frames; plus the display and staging frames (~224 KB total).
+static const int kPrefetchSlots = 5;
 static const size_t kFrameBytes = 128 * 128 * sizeof(uint16_t);
 
 // PNGdec RGB565_BIG_ENDIAN + draw16bitBeRGBBitmap. Switch to LITTLE_ENDIAN +
@@ -57,11 +58,13 @@ struct CachedFrame {
   char stamp[15];
 };
 static CachedFrame frameCache[kPrefetchSlots] = {};
+static int activePrefetchSlot = -1;
 static PNG png;
 static bool fetching = false;
 static bool haveFrame = false;
 static int loadedIndex = -1;
 static char loadedStamp[15] = "";
+static unsigned long loadedFetchedMs = 0;
 static int failedIndex = -1;
 static uint32_t resizeUs = 0;
 static unsigned long lastFetchMs = 0;
@@ -187,9 +190,16 @@ static void showLoadingFor(int index) {
 static int findCachedFrame(int index) {
   unsigned long now = millis();
   for (int i = 0; i < kPrefetchSlots; i++) {
-    if (frameCache[i].index == index && now - frameCache[i].fetchedMs < kRefreshMs) return i;
+    if (i != activePrefetchSlot && frameCache[i].index == index &&
+        now - frameCache[i].fetchedMs < kRefreshMs) return i;
   }
   return -1;
+}
+
+static int satelliteDistance(int a, int b) {
+  int forward = (a - b + kCount) % kCount;
+  int backward = (b - a + kCount) % kCount;
+  return forward < backward ? forward : backward;
 }
 
 static bool displayCachedFrame(int index) {
@@ -198,13 +208,47 @@ static bool displayCachedFrame(int index) {
   memcpy(frame, frameCache[slot].pixels, kFrameBytes);
   loadedIndex = index;
   memcpy(loadedStamp, frameCache[slot].stamp, sizeof(loadedStamp));
+  loadedFetchedMs = frameCache[slot].fetchedMs;
   loadingStatusIndex = -1;
   failedIndex = -1;
   haveFrame = true;
-  lastFetchMs = millis();
+  lastFetchMs = loadedFetchedMs;
   pushFrame();
   Serial.printf("cache hit %s\n", kRing[index].id);
   return true;
+}
+
+static void retainDisplayedFrame(int nextIndex) {
+  if (!haveFrame || loadedIndex < 0 || !loadedStamp[0] || findCachedFrame(loadedIndex) >= 0) return;
+
+  int slot = -1;
+  for (int i = 0; i < kPrefetchSlots; i++) {
+    if (i != activePrefetchSlot &&
+        (frameCache[i].index < 0 || millis() - frameCache[i].fetchedMs >= kRefreshMs)) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot < 0) {
+    // Keep the destination satellite's cached frame; evict the cache entry
+    // farthest from the satellite we are moving to.
+    int farthestDistance = -1;
+    for (int i = 0; i < kPrefetchSlots; i++) {
+      if (i == activePrefetchSlot || frameCache[i].index == nextIndex) continue;
+      int distance = satelliteDistance(frameCache[i].index, nextIndex);
+      if (distance > farthestDistance) {
+        farthestDistance = distance;
+        slot = i;
+      }
+    }
+  }
+  if (slot < 0) return;
+
+  memcpy(frameCache[slot].pixels, frame, kFrameBytes);
+  frameCache[slot].index = loadedIndex;
+  frameCache[slot].fetchedMs = loadedFetchedMs;
+  memcpy(frameCache[slot].stamp, loadedStamp, sizeof(frameCache[slot].stamp));
+  Serial.printf("cache keep %s\n", kRing[loadedIndex].id);
 }
 
 static void drawCacheDots() {
@@ -250,7 +294,9 @@ static void serviceButtons() {
         leftHoldIgnored = false;
       } else {
         if (!leftHoldIgnored && now - leftDownMs < kLeftHoldMs) {
-          satIndex = (satIndex + 7) % kCount;
+          int nextIndex = (satIndex + kCount - 1) % kCount;
+          retainDisplayedFrame(nextIndex);
+          satIndex = nextIndex;
           Serial.printf("sat <- %s\n", kRing[satIndex].id);
           if (!displayCachedFrame(satIndex)) {
             showLoadingFor(satIndex);
@@ -272,7 +318,9 @@ static void serviceButtons() {
       rightStable = right;
       rightEdgeMs = 0;
       if (rightStable == LOW) {
-        satIndex = (satIndex + 1) % kCount;
+        int nextIndex = (satIndex + 1) % kCount;
+        retainDisplayedFrame(nextIndex);
+        satIndex = nextIndex;
         Serial.printf("sat -> %s\n", kRing[satIndex].id);
         if (!displayCachedFrame(satIndex)) {
           showLoadingFor(satIndex);
@@ -569,20 +617,26 @@ static void loadUntilCaughtUp() {
     if (cached < 0) showLoadingFor(started);
     bool ok;
     char stamp[15] = "";
+    unsigned long frameFetchedAt = 0;
     if (cached >= 0) {
       ok = displayCachedFrame(started);
-      if (ok) memcpy(stamp, loadedStamp, sizeof(stamp));
+      if (ok) {
+        memcpy(stamp, loadedStamp, sizeof(stamp));
+        frameFetchedAt = loadedFetchedMs;
+      }
     } else {
       ok = loadSatellite(started, stagingFrame, false, stamp);
+      if (ok) frameFetchedAt = millis();
     }
     if (ok && satIndex == started) {
       if (cached < 0) memcpy(frame, stagingFrame, kFrameBytes);
       loadedIndex = started;
       memcpy(loadedStamp, stamp, sizeof(loadedStamp));
+      loadedFetchedMs = frameFetchedAt;
       loadingStatusIndex = -1;
       pushFrame();
       haveFrame = true;
-      lastFetchMs = millis();
+      lastFetchMs = loadedFetchedMs;
       failedIndex = -1;
     } else if (!ok) {
       failedIndex = started;
@@ -594,10 +648,23 @@ static void loadUntilCaughtUp() {
 }
 
 static void prefetchOneNeighbor() {
-  if (loadedIndex < 0 || fetching || !frameCache[0].pixels || !frameCache[1].pixels) return;
-  int candidates[2] = {(loadedIndex + 1) % kCount, (loadedIndex + kCount - 1) % kCount};
+  if (loadedIndex < 0 || fetching) return;
+  for (int i = 0; i < kPrefetchSlots; i++) {
+    if (!frameCache[i].pixels) return;
+  }
+
+  // Fill nearest neighbors first, alternating forward/backward, then widen out.
+  int candidates[kCount - 1];
+  int candidateCount = 0;
+  for (int distance = 1; distance <= kCount / 2; distance++) {
+    int next = (loadedIndex + distance) % kCount;
+    int prev = (loadedIndex + kCount - distance) % kCount;
+    candidates[candidateCount++] = next;
+    if (prev != next && prev != loadedIndex) candidates[candidateCount++] = prev;
+  }
+
   int target = -1;
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < candidateCount; i++) {
     if (findCachedFrame(candidates[i]) < 0 &&
         !(prefetchFailedIndex == candidates[i] && millis() - prefetchFailedMs < 60000)) {
       target = candidates[i];
@@ -606,15 +673,32 @@ static void prefetchOneNeighbor() {
   }
   if (target < 0) return;
 
-  int slot = 0;
-  if (frameCache[0].index >= 0 &&
-      (frameCache[1].index < 0 || frameCache[1].fetchedMs < frameCache[0].fetchedMs)) {
-    slot = 1;
+  int slot = -1;
+  for (int i = 0; i < kPrefetchSlots; i++) {
+    if (frameCache[i].index < 0 || millis() - frameCache[i].fetchedMs >= kRefreshMs) {
+      slot = i;
+      break;
+    }
   }
+  if (slot < 0) {
+    int farthestDistance = -1;
+    for (int i = 0; i < kPrefetchSlots; i++) {
+      if (frameCache[i].index == loadedIndex || frameCache[i].index == target) continue;
+      int distance = satelliteDistance(frameCache[i].index, loadedIndex);
+      if (distance > farthestDistance) {
+        farthestDistance = distance;
+        slot = i;
+      }
+    }
+  }
+  if (slot < 0) return;
+  frameCache[slot].index = -1;
+  activePrefetchSlot = slot;
   fetching = true;
   Serial.printf("prefetch %s\n", kRing[target].id);
   char stamp[15] = "";
   bool ok = loadSatellite(target, frameCache[slot].pixels, false, stamp);
+  activePrefetchSlot = -1;
   if (ok) {
     frameCache[slot].index = target;
     frameCache[slot].fetchedMs = millis();
@@ -623,6 +707,7 @@ static void prefetchOneNeighbor() {
     prefetchFailedIndex = -1;
     Serial.printf("cached %s\n", kRing[target].id);
   } else {
+    frameCache[slot].index = -1;
     prefetchFailedIndex = target;
     prefetchFailedMs = millis();
   }
