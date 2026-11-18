@@ -317,14 +317,22 @@ int onLine(PNGDRAW *p) {
 }
 
 static bool decodeToFrame(uint8_t *pngBuf, int pngLen) {
-  if (png.openRAM(pngBuf, pngLen, onLine) != PNG_SUCCESS) return false;
+  int openRc = png.openRAM(pngBuf, pngLen, onLine);
+  if (openRc != PNG_SUCCESS) {
+    Serial.printf("png open rc=%d err=%d\n", openRc, png.getLastError());
+    return false;
+  }
   int w = png.getWidth();
   int h = png.getHeight();
   if (w <= 0 || w > 700 || h <= 0) {
+    Serial.printf("png size refused %dx%d\n", w, h);
     png.close();
     return false;
   }
   int rc = png.decode(NULL, 0);
+  if (rc != PNG_SUCCESS) {
+    Serial.printf("png decode rc=%d err=%d\n", rc, png.getLastError());
+  }
   png.close();
   return rc == PNG_SUCCESS;
 }
